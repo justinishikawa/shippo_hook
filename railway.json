@@ -1,0 +1,12 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "numInstances": 1,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyLimit": 10,
+    "startCommand": "gunicorn -w 1 -b 0.0.0.0:$PORT shippo_webhook:app --timeout 30"
+  }
+}
