@@ -10,12 +10,19 @@ Setup:
 
 Usage:
     SHIPPO_API_KEY=your_shippo_api_key \
+    SHIPPO_REGISTRATION_API_KEY=your-registration-proxy-key \
     TELEGRAM_BOT_TOKEN=your_bot_token \
     TELEGRAM_CHAT_ID=your_chat_id \
     python3 shippo_webhook.py
+
+Endpoints:
+  POST /webhook/shippo      — Shippo webhook receiver (Telegram forwarder)
+  POST /register/tracking   — Register tracking (protected by X-API-Key)
+  GET  /health              — Health check
 """
 
 import os
+import re
 import json
 import threading
 from flask import Flask, request, abort
@@ -96,6 +103,69 @@ def format_tracking_message(payload: dict) -> str:
     return "\n".join(lines)
 
 
+# ─── Tracking Registration ────────────────────────────────────────────────────
+
+SHIPPO_API_URL = "https://api.goshippo.com/tracks/"
+
+KNOWN_CARRIERS = ["ups", "fedex", "usps", "dhl", "amazon", "dhl_express", "lasership", "ontrac"]
+
+
+def infer_carrier(tracking_number: str) -> str | None:
+    """Infer Shippo carrier token from tracking number format."""
+    tn = tracking_number.strip().upper()
+
+    # UPS: 1Z prefix (e.g., 1Z999AA10123456784)
+    if re.match(r"^1Z[A-Z0-9]{16}$", tn):
+        return "ups"
+    # FedEx: 12-15 digits, commonly starts with 7/8/9
+    if re.match(r"^(7|8|9)\d{11,14}$", tn):
+        return "fedex"
+    # USPS: 20-30 digits, starts with 91
+    if re.match(r"^91\d{18,28}$", tn):
+        return "usps"
+    # DHL: 10 digits starting with 1-5
+    if re.match(r"^[1-5]\d{9}$", tn):
+        return "dhl"
+    # Amazon: TBA... or AMZN prefixes
+    if tn.startswith("TBA") or tn.startswith("AMZN"):
+        return "amazon"
+
+    return None
+
+
+def register_tracking(tracking_number: str, carrier: str = None, metadata: str = "") -> dict:
+    """Call Shippo tracks.create API."""
+    shippo_api_key = os.getenv("SHIPPO_API_KEY")
+    if not shippo_api_key:
+        raise ValueError("SHIPPO_API_KEY not set")
+
+    if not carrier:
+        carrier = infer_carrier(tracking_number)
+    if not carrier:
+        carriers_list = ", ".join(KNOWN_CARRIERS)
+        raise ValueError(
+            f"Could not infer carrier from tracking number: {tracking_number}\n"
+            f"Known carriers: {carriers_list}"
+        )
+
+    headers = {
+        "Authorization": f"ShippoToken {shippo_api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "carrier": carrier,
+        "tracking_number": tracking_number,
+    }
+    if metadata:
+        payload["metadata"] = metadata
+
+    resp = requests.post(SHIPPO_API_URL, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
 @app.route("/webhook/shippo", methods=["POST"])
 def shippo_webhook():
     """
@@ -138,6 +208,46 @@ def shippo_webhook():
             return {"error": str(e)}, 500
 
     return {"error": "Method not allowed"}, 405
+
+
+@app.route("/register/tracking", methods=["POST"])
+def register_tracking_endpoint():
+    """
+    Register a tracking number with Shippo.
+    Protected by X-API-Key header — must match SHIPPO_REGISTRATION_API_KEY.
+    """
+    # Auth check
+    api_key = os.getenv("SHIPPO_REGISTRATION_API_KEY")
+    if not api_key:
+        return {"error": "Registration not configured"}, 500
+
+    provided_key = request.headers.get("X-API-Key", "")
+    if provided_key != api_key:
+        return {"error": "Unauthorized"}, 401
+
+    # Parse body
+    try:
+        body = request.get_json()
+        if not body:
+            return {"error": "No JSON body"}, 400
+    except Exception:
+        return {"error": "Invalid JSON"}, 400
+
+    tracking_number = body.get("tracking_number")
+    if not tracking_number:
+        return {"error": "tracking_number is required"}, 400
+
+    carrier = body.get("carrier") or None
+    metadata = body.get("metadata", "")
+
+    try:
+        result = register_tracking(tracking_number, carrier=carrier, metadata=metadata)
+        return result, 200
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    except Exception as e:
+        print(f"❌ Shippo registration failed: {e}")
+        return {"error": "Shippo API error"}, 502
 
 
 @app.route("/health", methods=["GET"])
